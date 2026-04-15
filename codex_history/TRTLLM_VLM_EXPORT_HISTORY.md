@@ -201,6 +201,13 @@
   - output token ids: `[125726, 71531, 64205, 96097, 20281, 146917, 57082, 5953]`
   - output text: `ỡassociate消息 Tup:^(ဘigator�`
 - 이 결과는 품질 검증용이 아니라 “Alpamayo expert transformer를 TRT-LLM Qwen3 runtime에 태울 수 있는 구조적 호환성”을 확인한 것이다.
+- 로컬 git 기준 rollback 가능한 커밋 2개를 남겼다.
+  - `2b43a60` `Add TRT-LLM PyTorch backend VLM adapter and expert export tooling`
+  - `70db48a` `Make Alpamayo expert checkpoint TRT-LLM compatible`
+- 원격 GitHub에도 작업 브랜치를 올렸다.
+  - remote: `ys0333`
+  - branch: `codex/trtllm-progress`
+  - repo: `https://github.com/ys0333/alpamayo`
 
 ### 보완하면 좋을만한점
 - `generate_text()`가 실제 notebook/VQA 입력에서도 동작하는지 Alpamayo inference 경로로 한 번 더 검증하면 좋다.
@@ -214,3 +221,30 @@
 - Alpamayo `generate_text()`를 실제 입력 샘플로 호출해 TRT-LLM backend 통합이 제품 코드 수준에서도 동작하는지 확인한다.
 - `expert`는 이제 executor까지 올라오므로, 다음 단계는 `LLM.generate()`가 아니라 `inputs_embeds + custom position_ids + custom attention_mask`를 받는 전용 TRT-LLM `_torch` wrapper 방향으로 내려간다.
 - 각 단계가 통과할 때마다 git 커밋을 남겨 언제든지 rollback 가능한 기준점을 유지한다.
+
+## 2026-04-15 (Expert `_torch` forward smoke 진행)
+
+### 시도해본것
+- `tools/run_trtllm_torch_expert_forward_smoke.py`를 사용해 Alpamayo expert를 TRT-LLM `_torch` 모델로 직접 로드하고, `LLM.generate()`를 거치지 않는 hidden-state forward smoke를 수행했다.
+- `AttentionMetadata.is_cross` 판정을 다시 확인하고, no-cache self-attention smoke에서 `seq_lens_kv`를 별도 tensor로 주지 않도록 수정했다.
+- 수정 후 `/home/jys/workspace/alpamayo_qwen3_expert_hf`를 대상으로 `TRTLLM` attention backend와 `FULL` attention mask로 `_torch` forward를 다시 실행했다.
+
+### 실패한점
+- 이전의 `cross attention yet` assertion은 사라졌지만, 실제 TRTLLM attention backend 경로에서는 첫 self-attention layer 이후 `o_proj` 선형층 근처에서 `CUBLAS_STATUS_INTERNAL_ERROR`와 `cudaErrorIllegalAddress`가 발생했다.
+- 즉 현재 blocker는 metadata self/cross 구분이 아니라, TRTLLM backend에서 이 exported expert를 직접 forward할 때 발생하는 GPU kernel/runtime 오류다.
+- 샌드박스 안에서는 여전히 MPI 초기화가 막혀 `_torch` smoke는 외부 실행이 필요하다.
+
+### 성공한점
+- `seq_lens_kv`를 `None`으로 두는 수정으로 no-cache self-attention batch가 더 이상 cross-attention으로 분류되지 않음을 확인했다.
+- 따라서 direct `_torch` 경로의 첫 번째 구조적 blocker는 제거됐다.
+- 문제 축이 `attention metadata`에서 `TRTLLM backend runtime/kernel stability`로 좁혀졌다.
+
+### 보완하면 좋을만한점
+- 다음 실행은 `CUDA_LAUNCH_BLOCKING=1`과 더 작은 token 수로 다시 돌려 illegal access의 정확한 발생 위치를 좁히는 편이 좋다.
+- 같은 `_torch` smoke를 `VANILLA` backend로 다시 맞춰 `flash_attn` 의존성을 우회하거나, 필요한 경우 `flash_attn` 설치 여부를 별도로 점검해야 한다.
+- direct `_torch` smoke에 custom attention mask 인자를 미리 추가해두면 이후 diffusion 전용 mask를 넣을 때 스크립트를 다시 뜯지 않아도 된다.
+
+### 다음스텝
+- `CUDA_LAUNCH_BLOCKING=1` 조건으로 TRTLLM backend `_torch` forward를 재실행해 illegal memory access 지점을 더 좁힌다.
+- `VANILLA` backend 경로도 다시 검토해 pure PyTorch attention으로 hidden-state forward가 가능한지 확인한다.
+- 이후 `attention_mask_data`를 포함한 custom mask 입력을 붙여 diffusion `expert_denoiser_step`에 필요한 입력면을 맞춘다.
