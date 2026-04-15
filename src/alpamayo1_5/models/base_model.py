@@ -31,6 +31,7 @@ from transformers import (
     Qwen3VLForConditionalGeneration,
 )
 
+from alpamayo1_5.models.trtllm_backend import TrtllmQwen3VlmPytorchBackend
 from alpamayo1_5.models.token_utils import extract_text_tokens
 
 logger = logging.getLogger(__name__)
@@ -210,6 +211,16 @@ class ReasoningVLAConfig(PretrainedConfig):
         self,
         vlm_name_or_path: str = "Qwen/Qwen3-VL-8B-Instruct",
         vlm_backend: str = "qwenvl3",
+        use_trtllm_vlm_pytorch_backend: bool = False,
+        trtllm_vlm_model_dir: str | None = None,
+        trtllm_vlm_trust_remote_code: bool = True,
+        trtllm_vlm_max_batch_size: int = 1,
+        trtllm_vlm_max_num_tokens: int = 4096,
+        trtllm_vlm_max_seq_len: int = 4096,
+        trtllm_vlm_disable_overlap_scheduler: bool = True,
+        trtllm_vlm_disable_flashinfer_sampling: bool = True,
+        use_trtllm_expert_pytorch_backend: bool = False,
+        trtllm_expert_model_dir: str | None = None,
         traj_tokenizer_cfg: dict[str, Any] | None = None,
         hist_traj_tokenizer_cfg: dict[str, Any] | None = None,
         traj_vocab_size: int = 768,
@@ -228,6 +239,16 @@ class ReasoningVLAConfig(PretrainedConfig):
         self.vlm_backend = vlm_backend.lower()
         self.model_dtype = model_dtype
         self.attn_implementation = attn_implementation
+        self.use_trtllm_vlm_pytorch_backend = use_trtllm_vlm_pytorch_backend
+        self.trtllm_vlm_model_dir = trtllm_vlm_model_dir
+        self.trtllm_vlm_trust_remote_code = trtllm_vlm_trust_remote_code
+        self.trtllm_vlm_max_batch_size = trtllm_vlm_max_batch_size
+        self.trtllm_vlm_max_num_tokens = trtllm_vlm_max_num_tokens
+        self.trtllm_vlm_max_seq_len = trtllm_vlm_max_seq_len
+        self.trtllm_vlm_disable_overlap_scheduler = trtllm_vlm_disable_overlap_scheduler
+        self.trtllm_vlm_disable_flashinfer_sampling = trtllm_vlm_disable_flashinfer_sampling
+        self.use_trtllm_expert_pytorch_backend = use_trtllm_expert_pytorch_backend
+        self.trtllm_expert_model_dir = trtllm_expert_model_dir
 
         self.traj_tokenizer_cfg = traj_tokenizer_cfg
         self.hist_traj_tokenizer_cfg = hist_traj_tokenizer_cfg
@@ -320,6 +341,7 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         self.special_token_ids = {
             k: self.tokenizer.convert_tokens_to_ids(v) for k, v in SPECIAL_TOKENS.items()
         }
+        self._trtllm_vlm_backend: TrtllmQwen3VlmPytorchBackend | None = None
 
         # Log parameter count
         if print_param_count:
@@ -488,6 +510,33 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         generation_config.return_dict_in_generate = True
         generation_config.top_k = top_k
         generation_config.pad_token_id = self.tokenizer.pad_token_id
+
+        if self.config.use_trtllm_vlm_pytorch_backend:
+            if self._trtllm_vlm_backend is None:
+                if self.config.trtllm_vlm_model_dir is None:
+                    raise ValueError(
+                        "config.trtllm_vlm_model_dir must be set when "
+                        "use_trtllm_vlm_pytorch_backend=True"
+                    )
+                self._trtllm_vlm_backend = TrtllmQwen3VlmPytorchBackend(
+                    model_dir=self.config.trtllm_vlm_model_dir,
+                    trust_remote_code=self.config.trtllm_vlm_trust_remote_code,
+                    max_batch_size=self.config.trtllm_vlm_max_batch_size,
+                    max_num_tokens=self.config.trtllm_vlm_max_num_tokens,
+                    max_seq_len=self.config.trtllm_vlm_max_seq_len,
+                    disable_overlap_scheduler=self.config.trtllm_vlm_disable_overlap_scheduler,
+                    disable_flashinfer_sampling=self.config.trtllm_vlm_disable_flashinfer_sampling,
+                )
+            return self._trtllm_vlm_backend.generate_text(
+                data=data,
+                input_ids=input_ids,
+                tokenizer=self.tokenizer,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+                num_samples=num_samples,
+                max_generation_length=max_generation_length,
+            )
 
         generated = self.vlm.generate(
             input_ids=input_ids, **tokenized_data, generation_config=generation_config
