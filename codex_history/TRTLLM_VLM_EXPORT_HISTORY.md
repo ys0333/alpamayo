@@ -175,6 +175,8 @@
 - `flashinfer` 샘플러 문제를 피하기 위해 로컬 TRT-LLM 코드에서 이미 지원하는 `disable_flashinfer_sampling` 옵션을 찾아 adapter와 smoke 스크립트에 반영했다.
 - `Qwen3` export config의 `rope_scaling`을 TRT-LLM이 이해하는 `mrope` 형태로 정규화하도록 `tools/export_qwen3vl_text_decoder.py`와 `tools/export_alpamayo_expert_to_qwen3.py`를 수정했다.
 - repacked expert 체크포인트를 `/home/jys/workspace/alpamayo_qwen3_expert_hf`로 실제 생성했다.
+- `expert`용 `embed_tokens`와 `lm_head`를 hidden size `2048`에 맞는 dummy tensor로 생성하도록 export 스크립트를 수정했다.
+- 수정된 expert 체크포인트로 TRT-LLM `pytorch backend` executor와 generation smoke를 다시 수행했다.
 
 ### 실패한점
 - 초기 `expert` export는 Alpamayo top-level config에 `text_config`가 없어서 실패했다. VLM repacked config의 `text_config`를 기준으로 다시 묶어 해결했다.
@@ -182,6 +184,7 @@
 - `rope_scaling`을 `mrope`로 정규화한 뒤에는 더 깊은 구조 mismatch가 드러났다. `expert`의 hidden size는 `2048`인데 내가 끌어온 `vlm`의 `embed_tokens`와 `lm_head`는 `4096` 차원이라 weight load에서 깨진다.
 - 즉 `expert`는 HF `Qwen3ForCausalLM` 포맷처럼 보이게 만드는 것만으로는 부족하고, Alpamayo 원래 구조처럼 `inputs_embeds` 전용 경로를 유지해야 한다.
 - `Qwen3-VL` smoke는 기본 sampler에서 `flashinfer`를 타다가 `FlashInfer requires GPUs with sm75 or higher`로 실패했다.
+- `expert`를 VLM 쪽 `embed_tokens`/`lm_head`와 함께 묶는 초기 설계는 hidden size mismatch (`2048` vs `4096`) 때문에 실패했다.
 
 ### 성공한점
 - Alpamayo product code 안에 TRT-LLM `pytorch backend`를 직접 호출하는 VLM adapter를 넣었다.
@@ -192,6 +195,12 @@
   - output text: `<i1496><i1497><i1503><i1503><i1503><i1503><i1503><i1503>`
 - 즉 `Qwen3-VL backbone`은 현재 환경에서 “정적 engine”이 아니라 “TRT-LLM PyTorch backend + flashinfer sampling 비활성화” 경로로는 실제 구동 가능함을 확인했다.
 - `expert` 쪽도 단순한 unsupported 문제가 아니라, 더 구체적으로는 `embed/lm_head` 차원 불일치가 blocker라는 점을 코드/실행 로그로 좁혔다.
+- `expert`는 dummy-compatible export로 다시 내리면 TRT-LLM `pytorch backend`에서 실제 executor 초기화와 generation까지 완료된다.
+- 2026-04-15 기준 `/home/jys/workspace/alpamayo_qwen3_expert_hf`에 대해 다음 smoke 결과를 얻었다.
+  - prompt: `Summarize the scene briefly.`
+  - output token ids: `[125726, 71531, 64205, 96097, 20281, 146917, 57082, 5953]`
+  - output text: `ỡassociate消息 Tup:^(ဘigator�`
+- 이 결과는 품질 검증용이 아니라 “Alpamayo expert transformer를 TRT-LLM Qwen3 runtime에 태울 수 있는 구조적 호환성”을 확인한 것이다.
 
 ### 보완하면 좋을만한점
 - `generate_text()`가 실제 notebook/VQA 입력에서도 동작하는지 Alpamayo inference 경로로 한 번 더 검증하면 좋다.
@@ -199,9 +208,9 @@
 - `expert`는 `embed_tokens`와 `lm_head`가 실제로 필요 없는 구조이므로, dummy weight를 넣어 executor만 세우는 실험과 `inputs_embeds` 전용 custom runtime 실험을 분리해서 진행하는 게 좋다.
 - VLM smoke 결과가 trajectory discrete token으로만 나온 만큼, sampling/stop 설정이나 prompt 형식을 Alpamayo VQA 메시지에 더 가깝게 맞춰 품질 확인을 더 해야 한다.
 - 현재 GPU/driver 조합에서 `flashinfer` sampler가 깨지므로, 이후 작업에서는 `disable_flashinfer_sampling`를 기본값으로 보는 편이 안전하다.
+- `expert` smoke는 dummy embedding/head를 사용하므로, diffusion 통합 단계에서는 `generate()` 대신 hidden-state 전용 forward 경로를 별도로 만들어야 한다.
 
 ### 다음스텝
 - Alpamayo `generate_text()`를 실제 입력 샘플로 호출해 TRT-LLM backend 통합이 제품 코드 수준에서도 동작하는지 확인한다.
-- `expert` export는 `embed_tokens`와 `lm_head`를 hidden size `2048`에 맞는 dummy tensor로 바꿔 executor 초기화만 통과하는지 먼저 확인한다.
-- 그다음 `expert`는 `LLM.generate()`가 아니라 `inputs_embeds + custom position_ids + custom attention_mask`를 받는 전용 TRT-LLM `_torch` wrapper 방향으로 내려간다.
+- `expert`는 이제 executor까지 올라오므로, 다음 단계는 `LLM.generate()`가 아니라 `inputs_embeds + custom position_ids + custom attention_mask`를 받는 전용 TRT-LLM `_torch` wrapper 방향으로 내려간다.
 - 각 단계가 통과할 때마다 git 커밋을 남겨 언제든지 rollback 가능한 기준점을 유지한다.

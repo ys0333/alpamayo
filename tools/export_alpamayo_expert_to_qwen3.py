@@ -10,6 +10,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -22,10 +23,6 @@ TOKENIZER_FILES = [
     "vocab.json",
     "chat_template.jinja",
 ]
-
-VLM_EMBED_KEY = "vlm.model.language_model.embed_tokens.weight"
-VLM_LM_HEAD_KEY = "vlm.lm_head.weight"
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -90,34 +87,21 @@ def build_expert_config(
 
 def collect_expert_groups(
     alpamayo_dir: Path,
-) -> tuple[dict[str, list[str]], dict[str, str], str | None, str | None]:
+) -> tuple[dict[str, list[str]], dict[str, str]]:
     index_payload = load_json(alpamayo_dir / "model.safetensors.index.json")
     weight_map = index_payload["weight_map"]
     grouped: dict[str, list[str]] = defaultdict(list)
-    embed_shard = weight_map.get(VLM_EMBED_KEY)
-    lm_head_shard = weight_map.get(VLM_LM_HEAD_KEY)
 
     for source_key, shard_name in weight_map.items():
         if source_key.startswith("expert."):
             grouped[shard_name].append(source_key)
 
-    if embed_shard is not None:
-        grouped[embed_shard].append(VLM_EMBED_KEY)
-    if lm_head_shard is not None and lm_head_shard != embed_shard:
-        grouped[lm_head_shard].append(VLM_LM_HEAD_KEY)
-    elif lm_head_shard is not None and lm_head_shard == embed_shard:
-        grouped[lm_head_shard].append(VLM_LM_HEAD_KEY)
-
-    return grouped, weight_map, embed_shard, lm_head_shard
+    return grouped, weight_map
 
 
 def target_key(source_key: str) -> str:
     if source_key.startswith("expert."):
         return "model." + source_key.removeprefix("expert.")
-    if source_key == VLM_EMBED_KEY:
-        return "model.embed_tokens.weight"
-    if source_key == VLM_LM_HEAD_KEY:
-        return "lm_head.weight"
     raise KeyError(f"Unexpected source key: {source_key}")
 
 
@@ -132,10 +116,14 @@ def repack_weights(
     alpamayo_dir: Path,
     output_dir: Path,
     grouped_keys: dict[str, list[str]],
+    hidden_size: int,
+    vocab_size: int,
+    dtype_name: str,
 ) -> tuple[dict[str, str], int]:
     output_weight_map: dict[str, str] = {}
     total_parameters = 0
     total_shards = len(grouped_keys)
+    dtype = getattr(torch, dtype_name, torch.bfloat16)
 
     for shard_idx, source_shard_name in enumerate(sorted(grouped_keys), start=1):
         tensors = {}
@@ -146,6 +134,16 @@ def repack_weights(
                 tensors[target_key(source_key)] = tensor
                 output_weight_map[target_key(source_key)] = output_shard_name
                 total_parameters += tensor.numel()
+        if shard_idx == 1:
+            # Alpamayo expert consumes `inputs_embeds` and does not use token embeddings or lm_head.
+            # We still provide shape-compatible tensors so TRT-LLM can instantiate a causal LM wrapper.
+            embed = torch.zeros((vocab_size, hidden_size), dtype=dtype)
+            lm_head = torch.zeros((vocab_size, hidden_size), dtype=dtype)
+            tensors["model.embed_tokens.weight"] = embed
+            tensors["lm_head.weight"] = lm_head
+            output_weight_map["model.embed_tokens.weight"] = output_shard_name
+            output_weight_map["lm_head.weight"] = output_shard_name
+            total_parameters += embed.numel() + lm_head.numel()
         save_file(tensors, output_dir / output_shard_name, metadata={"format": "pt"})
 
     return output_weight_map, total_parameters
@@ -159,7 +157,11 @@ def main() -> None:
 
     alpamayo_config = load_json(alpamayo_dir / "config.json")
     vlm_config = load_json(tokenizer_dir / "config.json")
-    grouped_keys, weight_map, embed_shard, lm_head_shard = collect_expert_groups(alpamayo_dir)
+    grouped_keys, weight_map = collect_expert_groups(alpamayo_dir)
+    export_config = build_expert_config(alpamayo_config, vlm_config)
+    hidden_size = int(export_config["hidden_size"])
+    vocab_size = int(export_config["vocab_size"])
+    dtype_name = str(export_config.get("torch_dtype", "bfloat16"))
 
     summary = {
         "alpamayo_dir": str(alpamayo_dir),
@@ -167,26 +169,32 @@ def main() -> None:
         "output_dir": str(output_dir),
         "expert_tensor_count": sum(len(keys) for keys in grouped_keys.values()),
         "expert_shard_count": len(grouped_keys),
-        "embed_shard": embed_shard,
-        "lm_head_shard": lm_head_shard,
+        "dummy_embed_shape": [vocab_size, hidden_size],
+        "dummy_lm_head_shape": [vocab_size, hidden_size],
         "sample_target_keys": [
             target_key(key)
             for key in (
                 "expert.layers.0.self_attn.q_proj.weight",
-                VLM_EMBED_KEY,
-                VLM_LM_HEAD_KEY,
             )
             if key in weight_map
-        ],
+        ]
+        + ["model.embed_tokens.weight", "lm_head.weight"],
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     if args.dry_run:
         return
 
     ensure_output_dir(output_dir, overwrite=args.overwrite)
-    save_json(output_dir / "config.json", build_expert_config(alpamayo_config, vlm_config))
+    save_json(output_dir / "config.json", export_config)
     copy_tokenizer_files(tokenizer_dir, output_dir)
-    output_weight_map, total_parameters = repack_weights(alpamayo_dir, output_dir, grouped_keys)
+    output_weight_map, total_parameters = repack_weights(
+        alpamayo_dir,
+        output_dir,
+        grouped_keys,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        dtype_name=dtype_name,
+    )
     save_json(
         output_dir / "model.safetensors.index.json",
         {
