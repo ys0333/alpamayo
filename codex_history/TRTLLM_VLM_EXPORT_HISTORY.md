@@ -233,18 +233,24 @@
 - 이전의 `cross attention yet` assertion은 사라졌지만, 실제 TRTLLM attention backend 경로에서는 첫 self-attention layer 이후 `o_proj` 선형층 근처에서 `CUBLAS_STATUS_INTERNAL_ERROR`와 `cudaErrorIllegalAddress`가 발생했다.
 - 즉 현재 blocker는 metadata self/cross 구분이 아니라, TRTLLM backend에서 이 exported expert를 직접 forward할 때 발생하는 GPU kernel/runtime 오류다.
 - 샌드박스 안에서는 여전히 MPI 초기화가 막혀 `_torch` smoke는 외부 실행이 필요하다.
+- `CUDA_LAUNCH_BLOCKING=1`, `--num-tokens 1`, `--batch-size 1`까지 줄여도 같은 위치에서 `CUBLAS_STATUS_EXECUTION_FAILED`와 illegal memory access가 발생했다.
+- `VANILLA` attention backend는 같은 direct forward 경로에서 `flash_attn` 패키지가 없어 `ModuleNotFoundError: No module named 'flash_attn'`로 중단됐다.
 
 ### 성공한점
 - `seq_lens_kv`를 `None`으로 두는 수정으로 no-cache self-attention batch가 더 이상 cross-attention으로 분류되지 않음을 확인했다.
 - 따라서 direct `_torch` 경로의 첫 번째 구조적 blocker는 제거됐다.
 - 문제 축이 `attention metadata`에서 `TRTLLM backend runtime/kernel stability`로 좁혀졌다.
+- 최소 토큰 조건에서도 동일하게 재현되므로, 현재 문제는 단순 배치 크기나 prompt 길이보다 backend kernel/환경 조합에 더 가깝다.
+- `VANILLA` backend 실험으로 direct `_torch` forward 자체가 완전히 틀린 게 아니라, 대체 경로가 `flash_attn` 의존성에 막혀 있다는 점도 분리했다.
 
 ### 보완하면 좋을만한점
 - 다음 실행은 `CUDA_LAUNCH_BLOCKING=1`과 더 작은 token 수로 다시 돌려 illegal access의 정확한 발생 위치를 좁히는 편이 좋다.
 - 같은 `_torch` smoke를 `VANILLA` backend로 다시 맞춰 `flash_attn` 의존성을 우회하거나, 필요한 경우 `flash_attn` 설치 여부를 별도로 점검해야 한다.
 - direct `_torch` smoke에 custom attention mask 인자를 미리 추가해두면 이후 diffusion 전용 mask를 넣을 때 스크립트를 다시 뜯지 않아도 된다.
+- `SM 12.x requires CUDA >= 12.9` 경고가 계속 보이므로, 현재 TRTLLM direct attention backend 실패가 CUDA/toolchain mismatch와 연결되는지 우선 확인해야 한다.
 
 ### 다음스텝
 - `CUDA_LAUNCH_BLOCKING=1` 조건으로 TRTLLM backend `_torch` forward를 재실행해 illegal memory access 지점을 더 좁힌다.
 - `VANILLA` backend 경로도 다시 검토해 pure PyTorch attention으로 hidden-state forward가 가능한지 확인한다.
 - 이후 `attention_mask_data`를 포함한 custom mask 입력을 붙여 diffusion `expert_denoiser_step`에 필요한 입력면을 맞춘다.
+- 필요하면 `flash_attn` 설치 가능성 또는 현재 `venvs/trtllm` CUDA 조합 재정렬 가능성을 점검한다.
