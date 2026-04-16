@@ -32,6 +32,9 @@ class Alpamayo1_5Config(ReasoningVLAConfig):
         action_in_proj_cfg: dict[str, Any] | None = None,
         action_out_proj_cfg: dict[str, Any] | None = None,
         expert_cfg: dict[str, Any] | None = None,
+        expert_cross_attention_layers: str | int | list[int] | None = None,
+        expert_cross_attention_replace_prefix: bool = True,
+        expert_prefix_layers: str | int | list[int] | None = None,
         keep_same_dtype: bool = True,
         expert_non_causal_attention: bool = True,
         include_camera_ids: bool = False,
@@ -44,6 +47,9 @@ class Alpamayo1_5Config(ReasoningVLAConfig):
         self.action_in_proj_cfg = action_in_proj_cfg
         self.action_out_proj_cfg = action_out_proj_cfg
         self.expert_cfg = expert_cfg
+        self.expert_cross_attention_layers = expert_cross_attention_layers
+        self.expert_cross_attention_replace_prefix = expert_cross_attention_replace_prefix
+        self.expert_prefix_layers = expert_prefix_layers
         self.keep_same_dtype = keep_same_dtype
         self.expert_non_causal_attention = expert_non_causal_attention
         self.include_camera_ids = include_camera_ids

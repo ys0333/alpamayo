@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+from contextlib import contextmanager
 from functools import partial
 import logging
 from typing import Any
@@ -32,6 +33,13 @@ from transformers import (
 
 from alpamayo1_5.action_space import ActionSpace
 from alpamayo1_5.models.base_model import ReasoningVLA
+from alpamayo1_5.models.expert_selective_layer import (
+    attach_expert_cross_attention,
+    begin_attention_debug_capture,
+    get_attention_debug_state,
+    remap_expert_state_dict_for_cross_attention,
+    reset_attention_debug_state,
+)
 from alpamayo1_5.config import Alpamayo1_5Config
 from alpamayo1_5.diffusion.base import BaseDiffusion
 from alpamayo1_5.models.token_utils import (
@@ -43,6 +51,20 @@ from alpamayo1_5.models.token_utils import (
 from alpamayo1_5.nav_utils import remove_nav_text
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def nvtx_range(message: str):
+    """Annotate a code region for Nsight when CUDA is available."""
+    if not torch.cuda.is_available():
+        yield
+        return
+
+    torch.cuda.nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 class ExpertLogitsProcessor(LogitsProcessor):
@@ -99,6 +121,15 @@ class Alpamayo1_5(ReasoningVLA):
             for key, value in config.expert_cfg.items():
                 setattr(expert_config, key, value)
         self.expert = AutoModel.from_config(expert_config)
+        (
+            self.expert_cross_attention_layers,
+            self.expert_wrapped_layers,
+        ) = attach_expert_cross_attention(
+            self.expert,
+            config.expert_cross_attention_layers,
+            replace_prefix_self_attention=config.expert_cross_attention_replace_prefix,
+            prefix_self_attention_layers=config.expert_prefix_layers,
+        )
         # we don't need the embed_tokens of the expert model
         del self.expert.embed_tokens
 
@@ -127,6 +158,46 @@ class Alpamayo1_5(ReasoningVLA):
             self.action_out_proj = self.action_out_proj.to(dtype=expert_dtype)
 
         self.post_init()
+
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = True, assign: bool = False):
+        """Remap wrapped expert layer keys so pretrained weights still load into `base_layer.*`."""
+        if getattr(self, "expert_wrapped_layers", None):
+            state_dict = remap_expert_state_dict_for_cross_attention(
+                state_dict,
+                self.expert_wrapped_layers,
+            )
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+    def _get_key_renaming_mapping(
+        self,
+        checkpoint_keys: list[str],
+        key_mapping: dict[str, str] | None = None,
+        loading_base_model_from_task_state_dict: bool = False,
+        loading_task_model_from_base_state_dict: bool = False,
+    ) -> dict[str, str]:
+        """Teach HF loading how wrapped expert layer keys map to checkpoint keys."""
+        mapping = super()._get_key_renaming_mapping(
+            checkpoint_keys,
+            key_mapping=key_mapping,
+            loading_base_model_from_task_state_dict=loading_base_model_from_task_state_dict,
+            loading_task_model_from_base_state_dict=loading_task_model_from_base_state_dict,
+        )
+        if not getattr(self, "expert_wrapped_layers", None):
+            return mapping
+
+        expected_keys = set(self.state_dict().keys())
+        for idx in self.expert_wrapped_layers:
+            prefix = f"expert.layers.{idx}."
+            wrapped_prefix = f"{prefix}base_layer."
+            for checkpoint_key, current_key in list(mapping.items()):
+                if not current_key.startswith(prefix):
+                    continue
+                if current_key.startswith(wrapped_prefix):
+                    continue
+                wrapped_key = wrapped_prefix + current_key[len(prefix) :]
+                if wrapped_key in expected_keys:
+                    mapping[checkpoint_key] = wrapped_key
+        return mapping
 
     @staticmethod
     def _find_eos_offset(
@@ -211,6 +282,20 @@ class Alpamayo1_5(ReasoningVLA):
 
         return position_ids, attention_mask
 
+    @staticmethod
+    def _time_cuda_section(fn: Any) -> tuple[Any, float | None]:
+        """Run a callable and, when on CUDA, return elapsed time in milliseconds."""
+        if not torch.cuda.is_available():
+            return fn(), None
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        result = fn()
+        end_event.record()
+        end_event.synchronize()
+        return result, float(start_event.elapsed_time(end_event))
+
     def sample_trajectories_from_data_with_vlm_rollout(
         self,
         data: dict[str, Any],
@@ -252,7 +337,8 @@ class Alpamayo1_5(ReasoningVLA):
             "ego_history_xyz": ego_history_xyz,
             "ego_history_rot": ego_history_rot,
         }
-        input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
+        with nvtx_range("fuse_traj_tokens"):
+            input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
         device = input_ids.device
 
         # 1) run autoregressive generation for the VLM
@@ -269,6 +355,10 @@ class Alpamayo1_5(ReasoningVLA):
         generation_config.return_dict_in_generate = True
         generation_config.top_k = top_k
         generation_config.pad_token_id = self.tokenizer.pad_token_id
+        return_timings = bool(kwargs.get("return_timings", False))
+        return_attention_debug = bool(kwargs.get("return_attention_debug", False))
+        timings_ms: dict[str, float] = {}
+        reset_attention_debug_state(enabled=return_attention_debug, capture_once=True)
 
         # use custom stopping criteria to stop after EOS token + one more token,
         # because the KV cache is updated after the next token is generated
@@ -282,43 +372,51 @@ class Alpamayo1_5(ReasoningVLA):
                 )
             ]
         )
-        vlm_outputs = self.vlm.generate(
-            input_ids=input_ids,
-            generation_config=generation_config,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
-            **tokenized_data,
-        )
-        vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
+        with nvtx_range("vlm_generate"):
+            def _run_vlm_generate():
+                return self.vlm.generate(
+                    input_ids=input_ids,
+                    generation_config=generation_config,
+                    stopping_criteria=stopping_criteria,
+                    logits_processor=logits_processor,
+                    **tokenized_data,
+                )
 
-        # manually replace padding after EOS token
-        vlm_outputs.sequences = replace_padding_after_eos(
-            token_ids=vlm_outputs.sequences,
-            eos_token_id=eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
-        prompt_cache = vlm_outputs.past_key_values
-        prefill_seq_len = prompt_cache.get_seq_length()
+            vlm_outputs, vlm_generate_ms = self._time_cuda_section(_run_vlm_generate)
+            if vlm_generate_ms is not None:
+                timings_ms["vlm_generate"] = vlm_generate_ms
 
-        b_star = vlm_outputs.sequences.shape[0]
-        n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
-        offset = self._find_eos_offset(
-            sequences=vlm_outputs.sequences,
-            eos_token_id=eos_token_id,
-            device=device,
-        )
-        prefix_mask = tokenized_data.get("attention_mask")
-        if prefix_mask is not None:
-            prefix_mask = torch.repeat_interleave(prefix_mask, n_samples_total, dim=0)
-        position_ids, attention_mask = self._build_expert_pos_ids_and_attn_mask(
-            offset=offset,
-            rope_deltas=vlm_outputs.rope_deltas,
-            kv_cache_seq_len=prefill_seq_len,
-            n_diffusion_tokens=n_diffusion_tokens,
-            b_star=b_star,
-            device=device,
-            prefix_mask=prefix_mask,
-        )
+        with nvtx_range("postprocess_generate_outputs"):
+            vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
+
+            # manually replace padding after EOS token
+            vlm_outputs.sequences = replace_padding_after_eos(
+                token_ids=vlm_outputs.sequences,
+                eos_token_id=eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+            prompt_cache = vlm_outputs.past_key_values
+            prefill_seq_len = prompt_cache.get_seq_length()
+
+            b_star = vlm_outputs.sequences.shape[0]
+            n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
+            offset = self._find_eos_offset(
+                sequences=vlm_outputs.sequences,
+                eos_token_id=eos_token_id,
+                device=device,
+            )
+            prefix_mask = tokenized_data.get("attention_mask")
+            if prefix_mask is not None:
+                prefix_mask = torch.repeat_interleave(prefix_mask, n_samples_total, dim=0)
+            position_ids, attention_mask = self._build_expert_pos_ids_and_attn_mask(
+                offset=offset,
+                rope_deltas=vlm_outputs.rope_deltas,
+                kv_cache_seq_len=prefill_seq_len,
+                n_diffusion_tokens=n_diffusion_tokens,
+                b_star=b_star,
+                device=device,
+                prefix_mask=prefix_mask,
+            )
 
         forward_kwargs = {}
         if self.config.expert_non_causal_attention:
@@ -329,45 +427,59 @@ class Alpamayo1_5(ReasoningVLA):
             x: torch.Tensor,
             t: torch.Tensor,
         ) -> torch.Tensor:
-            # x: (B*, *action_dim)
-            # t: broadcastable to x leading dims
-            b_star = x.shape[0]
-            # Project noisy action to expert token embeddings for the n future tokens
-            # Expect shape (b*, n_token_per_traj, hidden_size)
-            future_token_embeds = self.action_in_proj(x, t)
-            if future_token_embeds.dim() == 2:
-                future_token_embeds = future_token_embeds.view(b_star, n_diffusion_tokens, -1)
+            with nvtx_range("denoiser_step"):
+                # x: (B*, *action_dim)
+                # t: broadcastable to x leading dims
+                b_star = x.shape[0]
+                with nvtx_range("action_in_proj"):
+                    # Project noisy action to expert token embeddings for the n future tokens
+                    # Expect shape (b*, n_token_per_traj, hidden_size)
+                    future_token_embeds = self.action_in_proj(x, t)
+                    if future_token_embeds.dim() == 2:
+                        future_token_embeds = future_token_embeds.view(
+                            b_star, n_diffusion_tokens, -1
+                        )
 
-            # Run expert with cached prefill, only on the future tokens
-            expert_out_base = self.expert(
-                inputs_embeds=future_token_embeds,
-                position_ids=position_ids,
-                past_key_values=prompt_cache,
-                attention_mask=attention_mask,
-                use_cache=True,
-                **forward_kwargs,
-            )
-            # crop the prompt cache to remove the newly added tokens
-            prompt_cache.crop(prefill_seq_len)
-            last_hidden = expert_out_base.last_hidden_state  # (b*, Tf, hidden_size)
-            last_hidden = last_hidden[:, -n_diffusion_tokens:]
-            pred = self.action_out_proj(last_hidden).view(
-                -1, *self.action_space.get_action_space_dims()
-            )  # (b*, Tf, C_action) -> noise/vector field
-            return pred
+                with nvtx_range("expert_forward"):
+                    # Run expert with cached prefill, only on the future tokens
+                    begin_attention_debug_capture()
+                    expert_out_base = self.expert(
+                        inputs_embeds=future_token_embeds,
+                        position_ids=position_ids,
+                        past_key_values=prompt_cache,
+                        attention_mask=attention_mask,
+                        use_cache=True,
+                        **forward_kwargs,
+                    )
+                    # crop the prompt cache to remove the newly added tokens
+                    prompt_cache.crop(prefill_seq_len)
+
+                with nvtx_range("action_out_proj"):
+                    last_hidden = expert_out_base.last_hidden_state  # (b*, Tf, hidden_size)
+                    last_hidden = last_hidden[:, -n_diffusion_tokens:]
+                    pred = self.action_out_proj(last_hidden).view(
+                        -1, *self.action_space.get_action_space_dims()
+                    )  # (b*, Tf, C_action) -> noise/vector field
+                return pred
 
         # 3) Diffusion sampling in action space with multiple samples per input
         total_batch = B * n_samples_total
         if diffusion_kwargs is None:
             diffusion_kwargs = {}
 
-        sampled_action = self.diffusion.sample(
-            batch_size=total_batch,
-            step_fn=step_fn,
-            device=device,
-            return_all_steps=False,
-            **diffusion_kwargs,
-        )
+        with nvtx_range("diffusion_sample"):
+            def _run_diffusion_sample():
+                return self.diffusion.sample(
+                    batch_size=total_batch,
+                    step_fn=step_fn,
+                    device=device,
+                    return_all_steps=False,
+                    **diffusion_kwargs,
+                )
+
+            sampled_action, diffusion_sample_ms = self._time_cuda_section(_run_diffusion_sample)
+            if diffusion_sample_ms is not None:
+                timings_ms["diffusion_sample"] = diffusion_sample_ms
 
         # Repeat history to align with num_traj_samples
         hist_xyz_rep = einops.repeat(
@@ -377,27 +489,35 @@ class Alpamayo1_5(ReasoningVLA):
             ego_history_rot[:, -1], "b ... -> (b n) ...", n=n_samples_total
         )
 
-        pred_xyz, pred_rot = self.action_space.action_to_traj(
-            sampled_action, hist_xyz_rep, hist_rot_rep
-        )
+        with nvtx_range("action_to_traj"):
+            pred_xyz, pred_rot = self.action_space.action_to_traj(
+                sampled_action, hist_xyz_rep, hist_rot_rep
+            )
 
         # 4) Reshape to (B, num_traj_samples, n_traj, ...)
-        pred_xyz = einops.rearrange(
-            pred_xyz, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
-        )
-        pred_rot = einops.rearrange(
-            pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
-        )
+        with nvtx_range("format_outputs"):
+            pred_xyz = einops.rearrange(
+                pred_xyz, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
+            )
+            pred_rot = einops.rearrange(
+                pred_rot, "(b ns nj) ... -> b ns nj ...", ns=num_traj_sets, nj=num_traj_samples
+            )
 
-        # return the text tokens generated by the VLM
-        if kwargs.get("return_extra", False):
-            extra = extract_text_tokens(self.tokenizer, vlm_outputs.sequences)
-            # rearrange text tokens to shape [B, ns, nj] to match trajectory shape
-            for text_tokens in extra.keys():
-                extra[text_tokens] = np.array(extra[text_tokens]).reshape(
-                    [input_ids.shape[0], num_traj_sets, num_traj_samples]
-                )
-            return pred_xyz, pred_rot, extra
+            # return the text tokens generated by the VLM
+            if kwargs.get("return_extra", False):
+                extra = extract_text_tokens(self.tokenizer, vlm_outputs.sequences)
+                if return_timings and timings_ms:
+                    extra["timings_ms"] = timings_ms
+                if return_attention_debug:
+                    extra["attention_debug"] = get_attention_debug_state()
+                # rearrange text tokens to shape [B, ns, nj] to match trajectory shape
+                for text_tokens in extra.keys():
+                    if text_tokens in {"timings_ms", "attention_debug"}:
+                        continue
+                    extra[text_tokens] = np.array(extra[text_tokens]).reshape(
+                        [input_ids.shape[0], num_traj_sets, num_traj_samples]
+                    )
+                return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
 
     @torch.no_grad()
