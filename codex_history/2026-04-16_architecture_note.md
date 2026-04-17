@@ -671,3 +671,29 @@
   - `python3 -m py_compile src/alpamayo1_5/config.py src/alpamayo1_5/models/expert_selective_layer.py src/alpamayo1_5/models/alpamayo1_5.py src/alpamayo1_5/test_inference.py`
 - Next recommended step:
   - Start with a small head sweep on the best current sparse prefix set (for example `SELECT_PREFIX=0,1,4,5`) before attempting any full 36x16x128 dim sweep, which will be extremely expensive.
+
+## Ablation sweep design refinement
+- What was tried:
+  - Reworked the head/dim sweep scripts so the experiment design is built in, instead of requiring the user to hand-specify ranges.
+- Why it was tried:
+  - The user explicitly asked for the sweep scope to be designed in the scripts rather than left as unconstrained brute-force ranges.
+- What failed:
+  - The first head/dim sweep scripts were too generic and pushed the experimental design burden back onto the user.
+- Why it failed:
+  - Leaving the full 36x16x128 search space unconstrained is not a realistic default.
+- What succeeded:
+  - Redesigned `run_head_ablation_sweep.sh` to default to the best current sparse prefix set (`0,1,4,5`) and sweep all 36x16 heads under that context.
+  - Redesigned `run_dim_ablation_sweep.sh` to consume the latest head sweep summary and automatically select the top-N most sensitive heads (default 8), then sweep all 128 dims only for those heads.
+  - Added baseline rows and `delta_vs_baseline_m` columns to both summaries.
+- Why it succeeded:
+  - The current best sparse set and the natural hierarchy of `layer -> head -> dim` make a staged search much more tractable and interpretable.
+- Files created or changed:
+  - `tools/run_head_ablation_sweep.sh`
+  - `tools/run_dim_ablation_sweep.sh`
+  - `codex_history/2026-04-16_architecture_note.md`
+- Validation run:
+  - `bash -n tools/run_head_ablation_sweep.sh`
+  - `bash -n tools/run_dim_ablation_sweep.sh`
+  - `python3 -m py_compile src/alpamayo1_5/config.py src/alpamayo1_5/models/expert_selective_layer.py src/alpamayo1_5/models/alpamayo1_5.py src/alpamayo1_5/test_inference.py`
+- Next recommended step:
+  - Run `tools/run_head_ablation_sweep.sh` first, inspect the top heads by `delta_vs_baseline_m`, then let `tools/run_dim_ablation_sweep.sh` automatically refine only those heads.
