@@ -727,3 +727,31 @@
   - `python3 -m py_compile src/alpamayo1_5/config.py src/alpamayo1_5/models/expert_selective_layer.py src/alpamayo1_5/models/alpamayo1_5.py src/alpamayo1_5/test_inference.py`
 - Next recommended step:
   - Run `tools/run_drop_prefix_sweep.sh` first; only after identifying the least-sensitive dropped group should the refinement sweep or head/dim ablations be interpreted seriously.
+
+## Automatic full drop-prefix exploration
+- What was tried:
+  - Upgraded the drop-prefix sweep design so the first-stage script automatically explores the entire layer space instead of relying on hand-picked drop candidates.
+- Why it was tried:
+  - The user correctly pointed out that a proper first-pass sensitivity study should automatically test all blocks, not just manually chosen groups.
+- What failed:
+  - The previous drop-prefix sweep still depended on curated candidate groups.
+- Why it failed:
+  - It did not perform an exhaustive first-pass search over all 36 blocks.
+- What succeeded:
+  - `run_drop_prefix_sweep.sh` now runs:
+    - full-prefix baseline
+    - all 36 single-layer drop-prefix ablations
+    - coarse contiguous group drops (`GROUP_SIZE`, default 6)
+  - `run_drop_prefix_refine.sh` now automatically reads the latest sweep summary and reruns the least-sensitive single layers and groups instead of relying on hard-coded candidates.
+- Why it succeeded:
+  - Single-layer drop ablations are the direct measure of block sensitivity, and group drops provide coarse region-level context in the same pass.
+- Files created or changed:
+  - `tools/run_drop_prefix_sweep.sh`
+  - `tools/run_drop_prefix_refine.sh`
+  - `codex_history/2026-04-16_architecture_note.md`
+- Validation run:
+  - `bash -n tools/run_drop_prefix_sweep.sh`
+  - `bash -n tools/run_drop_prefix_refine.sh`
+  - `python3 -m py_compile src/alpamayo1_5/config.py src/alpamayo1_5/models/expert_selective_layer.py src/alpamayo1_5/models/alpamayo1_5.py src/alpamayo1_5/test_inference.py`
+- Next recommended step:
+  - Run `tools/run_drop_prefix_sweep.sh` to identify the least-sensitive dropped blocks, then only interpret head/dim ablations inside blocks that the first-pass full scan deems important.
