@@ -507,7 +507,13 @@ def attach_expert_cross_attention(
         ablate_head=ablate_head,
         ablate_dim=ablate_dim,
     )
-    if not indices and not prefix_indices and ablate_head is None and ablate_dim is None:
+    if (
+        not indices
+        and not prefix_indices
+        and not drop_prefix_indices
+        and ablate_head is None
+        and ablate_dim is None
+    ):
         return [], []
 
     wrapped_indices = list(range(len(layers)))
