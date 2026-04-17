@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -110,6 +111,53 @@ def _repeat_kv_heads(x: torch.Tensor, num_attention_heads: int) -> torch.Tensor:
     return x.repeat_interleave(repeats, dim=1)
 
 
+def _parse_ablate_head_spec(spec: str | None) -> tuple[int, int] | None:
+    if spec is None:
+        return None
+    parts = [part.strip() for part in spec.split(":") if part.strip()]
+    if len(parts) != 2:
+        raise ValueError(
+            f"Invalid ablate-head spec '{spec}'. Expected format '<layer>:<head>'."
+        )
+    return int(parts[0]), int(parts[1])
+
+
+def _parse_ablate_dim_spec(spec: str | None) -> tuple[int, int, int] | None:
+    if spec is None:
+        return None
+    parts = [part.strip() for part in spec.split(":") if part.strip()]
+    if len(parts) != 3:
+        raise ValueError(
+            f"Invalid ablate-dim spec '{spec}'. Expected format '<layer>:<head>:<dim>'."
+        )
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def _validate_ablation_indices(
+    *,
+    layer_idx: int,
+    num_layers: int,
+    num_heads: int,
+    head_dim: int,
+    ablate_head: tuple[int, int] | None,
+    ablate_dim: tuple[int, int, int] | None,
+) -> None:
+    if ablate_head is not None:
+        target_layer, target_head = ablate_head
+        if target_layer < 0 or target_layer >= num_layers:
+            raise ValueError(f"Invalid ablate-head layer index: {target_layer}")
+        if target_head < 0 or target_head >= num_heads:
+            raise ValueError(f"Invalid ablate-head head index: {target_head}")
+    if ablate_dim is not None:
+        target_layer, target_head, target_dim = ablate_dim
+        if target_layer < 0 or target_layer >= num_layers:
+            raise ValueError(f"Invalid ablate-dim layer index: {target_layer}")
+        if target_head < 0 or target_head >= num_heads:
+            raise ValueError(f"Invalid ablate-dim head index: {target_head}")
+        if target_dim < 0 or target_dim >= head_dim:
+            raise ValueError(f"Invalid ablate-dim dim index: {target_dim}")
+
+
 class ExpertKVCacheCrossAttention(nn.Module):
     """Cross-attention from diffusion hidden states into a read-only VLM KV cache."""
 
@@ -190,6 +238,8 @@ class Qwen3CrossAttentionDecoderLayer(nn.Module):
         base_layer: nn.Module,
         replace_prefix_self_attention: bool = True,
         enable_cross_attention: bool = True,
+        ablate_head_idx: int | None = None,
+        ablate_dim_idx: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         self.base_layer = base_layer
@@ -198,6 +248,8 @@ class Qwen3CrossAttentionDecoderLayer(nn.Module):
         self.layer_idx = base_layer.self_attn.layer_idx
         self.replace_prefix_self_attention = replace_prefix_self_attention
         self.enable_cross_attention = enable_cross_attention
+        self.ablate_head_idx = ablate_head_idx
+        self.ablate_dim_idx = ablate_dim_idx
 
         config = base_layer.self_attn.config
         self.cross_attn_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -210,6 +262,37 @@ class Qwen3CrossAttentionDecoderLayer(nn.Module):
             )
         else:
             self.cross_attn = None
+
+    @contextmanager
+    def _temporary_o_proj_ablation(self):
+        if self.ablate_head_idx is None and self.ablate_dim_idx is None:
+            yield
+            return
+
+        o_proj_weight = self.base_layer.self_attn.o_proj.weight
+        head_dim = self.base_layer.self_attn.head_dim
+        restored: list[tuple[slice | int, torch.Tensor]] = []
+
+        with torch.no_grad():
+            if self.ablate_head_idx is not None:
+                start = self.ablate_head_idx * head_dim
+                end = start + head_dim
+                restored.append((slice(start, end), o_proj_weight[:, start:end].clone()))
+                o_proj_weight[:, start:end] = 0
+            if self.ablate_dim_idx is not None:
+                head_idx, dim_idx = self.ablate_dim_idx
+                col_idx = head_idx * head_dim + dim_idx
+                restored.append((col_idx, o_proj_weight[:, col_idx].clone()))
+                o_proj_weight[:, col_idx] = 0
+        try:
+            yield
+        finally:
+            with torch.no_grad():
+                for key, value in restored:
+                    if isinstance(key, slice):
+                        o_proj_weight[:, key] = value
+                    else:
+                        o_proj_weight[:, key] = value
 
     def forward(
         self,
@@ -234,7 +317,7 @@ class Qwen3CrossAttentionDecoderLayer(nn.Module):
             self_attention_cache = None
         query_length = hidden_states.shape[1]
         if self_attention_cache is not None:
-            kv_length = self_attention_cache[layer_idx][0].shape[-2]
+            kv_length = self_attention_cache[self.layer_idx][0].shape[-2]
         else:
             kv_length = query_length
         _record_self_attention_debug(
@@ -244,16 +327,17 @@ class Qwen3CrossAttentionDecoderLayer(nn.Module):
             num_heads=self.base_layer.self_attn.config.num_attention_heads,
             uses_prefix=self_attention_cache is not None,
         )
-        hidden_states, _ = self.base_layer.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=self_attention_mask,
-            position_ids=position_ids,
-            past_key_values=self_attention_cache,
-            use_cache=use_cache and self_attention_cache is not None,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
+        with self._temporary_o_proj_ablation():
+            hidden_states, _ = self.base_layer.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=self_attention_mask,
+                position_ids=position_ids,
+                past_key_values=self_attention_cache,
+                use_cache=use_cache and self_attention_cache is not None,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
         hidden_states = residual + hidden_states
 
         if self.enable_cross_attention:
@@ -281,6 +365,8 @@ class Qwen3SelectivePrefixDecoderLayer(nn.Module):
         self,
         base_layer: nn.Module,
         keep_prefix_self_attention: bool,
+        ablate_head_idx: int | None = None,
+        ablate_dim_idx: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         self.base_layer = base_layer
@@ -288,6 +374,39 @@ class Qwen3SelectivePrefixDecoderLayer(nn.Module):
         self.attention_type = getattr(base_layer, "attention_type", "full_attention")
         self.layer_idx = base_layer.self_attn.layer_idx
         self.keep_prefix_self_attention = keep_prefix_self_attention
+        self.ablate_head_idx = ablate_head_idx
+        self.ablate_dim_idx = ablate_dim_idx
+
+    @contextmanager
+    def _temporary_o_proj_ablation(self):
+        if self.ablate_head_idx is None and self.ablate_dim_idx is None:
+            yield
+            return
+
+        o_proj_weight = self.base_layer.self_attn.o_proj.weight
+        head_dim = self.base_layer.self_attn.head_dim
+        restored: list[tuple[slice | int, torch.Tensor]] = []
+
+        with torch.no_grad():
+            if self.ablate_head_idx is not None:
+                start = self.ablate_head_idx * head_dim
+                end = start + head_dim
+                restored.append((slice(start, end), o_proj_weight[:, start:end].clone()))
+                o_proj_weight[:, start:end] = 0
+            if self.ablate_dim_idx is not None:
+                head_idx, dim_idx = self.ablate_dim_idx
+                col_idx = head_idx * head_dim + dim_idx
+                restored.append((col_idx, o_proj_weight[:, col_idx].clone()))
+                o_proj_weight[:, col_idx] = 0
+        try:
+            yield
+        finally:
+            with torch.no_grad():
+                for key, value in restored:
+                    if isinstance(key, slice):
+                        o_proj_weight[:, key] = value
+                    else:
+                        o_proj_weight[:, key] = value
 
     def forward(
         self,
@@ -322,16 +441,17 @@ class Qwen3SelectivePrefixDecoderLayer(nn.Module):
             num_heads=self.base_layer.self_attn.config.num_attention_heads,
             uses_prefix=self_attention_cache is not None,
         )
-        hidden_states, _ = self.base_layer.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=self_attention_mask,
-            position_ids=position_ids,
-            past_key_values=self_attention_cache,
-            use_cache=use_cache and self_attention_cache is not None,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
+        with self._temporary_o_proj_ablation():
+            hidden_states, _ = self.base_layer.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=self_attention_mask,
+                position_ids=position_ids,
+                past_key_values=self_attention_cache,
+                use_cache=use_cache and self_attention_cache is not None,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -363,6 +483,8 @@ def attach_expert_cross_attention(
     layer_spec: str | int | Iterable[int] | None,
     replace_prefix_self_attention: bool = True,
     prefix_self_attention_layers: str | int | Iterable[int] | None = None,
+    ablate_head_spec: str | None = None,
+    ablate_dim_spec: str | None = None,
 ) -> tuple[list[int], list[int]]:
     layers = getattr(expert, "layers", None)
     if layers is None:
@@ -370,12 +492,29 @@ def attach_expert_cross_attention(
 
     indices = resolve_cross_attention_layer_indices(len(layers), layer_spec)
     prefix_indices = resolve_cross_attention_layer_indices(len(layers), prefix_self_attention_layers)
-    if not indices and not prefix_indices:
+    ablate_head = _parse_ablate_head_spec(ablate_head_spec)
+    ablate_dim = _parse_ablate_dim_spec(ablate_dim_spec)
+    sample_attn = layers[0].self_attn
+    _validate_ablation_indices(
+        layer_idx=0,
+        num_layers=len(layers),
+        num_heads=sample_attn.config.num_attention_heads,
+        head_dim=sample_attn.head_dim,
+        ablate_head=ablate_head,
+        ablate_dim=ablate_dim,
+    )
+    if not indices and not prefix_indices and ablate_head is None and ablate_dim is None:
         return [], []
 
     wrapped_indices = list(range(len(layers)))
     cross_attention_enabled = bool(indices)
     for idx in wrapped_indices:
+        layer_ablate_head_idx = None
+        layer_ablate_dim_idx = None
+        if ablate_head is not None and ablate_head[0] == idx:
+            layer_ablate_head_idx = ablate_head[1]
+        if ablate_dim is not None and ablate_dim[0] == idx:
+            layer_ablate_dim_idx = (ablate_dim[1], ablate_dim[2])
         if cross_attention_enabled:
             layers[idx] = Qwen3CrossAttentionDecoderLayer(
                 layers[idx],
@@ -383,11 +522,15 @@ def attach_expert_cross_attention(
                     replace_prefix_self_attention and idx not in prefix_indices
                 ),
                 enable_cross_attention=idx in indices,
+                ablate_head_idx=layer_ablate_head_idx,
+                ablate_dim_idx=layer_ablate_dim_idx,
             )
         else:
             layers[idx] = Qwen3SelectivePrefixDecoderLayer(
                 layers[idx],
                 keep_prefix_self_attention=idx in prefix_indices,
+                ablate_head_idx=layer_ablate_head_idx,
+                ablate_dim_idx=layer_ablate_dim_idx,
             )
     return indices, wrapped_indices
 

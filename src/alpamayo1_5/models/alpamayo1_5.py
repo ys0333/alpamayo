@@ -129,6 +129,8 @@ class Alpamayo1_5(ReasoningVLA):
             config.expert_cross_attention_layers,
             replace_prefix_self_attention=config.expert_cross_attention_replace_prefix,
             prefix_self_attention_layers=config.expert_prefix_layers,
+            ablate_head_spec=config.expert_ablate_head,
+            ablate_dim_spec=config.expert_ablate_dim,
         )
         # we don't need the embed_tokens of the expert model
         del self.expert.embed_tokens

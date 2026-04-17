@@ -487,3 +487,187 @@
   - `git -C /home/jys/alpamayo1.5 status --short`
 - Next recommended step:
   - Commit only the relevant source/history files for this checkpoint and keep profiler artifacts or unrelated experimental directories out of the commit.
+
+## CLI cleanup
+- What was tried:
+  - Shortened the block-attention debug CLI flag.
+- Why it was tried:
+  - The user requested a shorter option name.
+- What failed:
+  - N/A.
+- Why it failed:
+  - N/A.
+- What succeeded:
+  - Renamed `--print-block-attn-stats` to `--print-block` while preserving the same behavior.
+- Why it succeeded:
+  - The debug path was isolated to a single CLI flag in `test_inference.py`.
+- Files created or changed:
+  - `src/alpamayo1_5/test_inference.py`
+- Validation run:
+  - `python3 -m py_compile src/alpamayo1_5/test_inference.py`
+- Next recommended step:
+  - Use `--print-block --nums 1` when validating selective-prefix layer behavior.
+
+## Selective prefix sweep script
+- What was tried:
+  - Added a shell script to automate selective-prefix sensitivity sweeps over multiple layer sets.
+- Why it was tried:
+  - The user wanted a practical experiment script that logs `minADE` and latency results to judge which layer sets are most sensitive.
+- What failed:
+  - N/A.
+- Why it failed:
+  - N/A.
+- What succeeded:
+  - Created `tools/run_selective_prefix_sweep.sh`.
+  - The script runs a fixed list of baseline / grouped / late-layer candidate prefix sets.
+  - It stores raw stdout per run under `codex_history/selective_prefix_sweep_<timestamp>/raw/` and writes a summary CSV with mean `minADE`, mean e2e latency, mean diffusion latency, and mean diffusion/e2e ratio.
+- Why it succeeded:
+  - `test_inference.py` already prints a parseable summary line when `--nums > 1`.
+- Files created or changed:
+  - `tools/run_selective_prefix_sweep.sh`
+  - `codex_history/2026-04-16_architecture_note.md`
+- Validation run:
+  - `bash -n tools/run_selective_prefix_sweep.sh`
+- Next recommended step:
+  - Run the sweep script inside the venv, inspect the summary CSV for the best group, then refine around the best-performing layer region with a second smaller sweep.
+
+## Sweep runner interpreter fix
+- What was tried:
+  - Fixed the sweep script's Python interpreter selection after all runs failed with `ModuleNotFoundError: numpy`.
+- Why it was tried:
+  - The initial script defaulted to a repo-local venv path that did not match the user's active environment.
+- What failed:
+  - The first sweep run.
+- Why it failed:
+  - `tools/run_selective_prefix_sweep.sh` invoked a Python interpreter without the project dependencies installed.
+- What succeeded:
+  - Updated the script to prefer `PYTHON_BIN` if provided, then the active `VIRTUAL_ENV`, then `/home/jys/a1_5_venv/bin/python3`, and only finally the repo-local fallback.
+- Why it succeeded:
+  - The user's actual interactive runs have been using the external `a1_5_venv`, not the repo-local fallback path.
+- Files created or changed:
+  - `tools/run_selective_prefix_sweep.sh`
+- Validation run:
+  - `bash -n tools/run_selective_prefix_sweep.sh`
+- Next recommended step:
+  - Re-run the sweep script from the activated `a1_5_venv`, or set `PYTHON_BIN=/home/jys/a1_5_venv/bin/python3` explicitly for reproducibility.
+
+## Sweep parser fix
+- What was tried:
+  - Fixed the sweep summary parser after the script completed runs but marked every case as `missing_summary`.
+- Why it was tried:
+  - The user's environment did not have `rg`, so the summary extraction step failed even though inference completed and printed summary lines.
+- What failed:
+  - Parsing the `Summary over ...` line from each raw log.
+- Why it failed:
+  - The script used `rg`, which was not installed in the shell environment running the sweep.
+- What succeeded:
+  - Replaced `rg` with `grep` for summary extraction.
+- Why it succeeded:
+  - `grep` is available by default and sufficient for this simple single-line parse.
+- Files created or changed:
+  - `tools/run_selective_prefix_sweep.sh`
+- Validation run:
+  - `bash -n tools/run_selective_prefix_sweep.sh`
+- Next recommended step:
+  - Re-run the sweep, or re-parse existing raw logs with the fixed script logic if you want the CSV summary without repeating all experiments.
+
+## Selective prefix sweep results
+- What was tried:
+  - Ran the automated selective-prefix sweep after fixing the interpreter and summary parsing.
+- Why it was tried:
+  - To estimate which layer groups are relatively more conditioning-sensitive under training-free prefix sparsification.
+- What failed:
+  - None of the tested sparse/grouped prefix settings preserved baseline accuracy.
+- Why it failed:
+  - The pretrained model is aligned to full-prefix conditioning, so naively dropping prefix from most layers causes substantial accuracy collapse.
+- What succeeded:
+  - Produced a valid summary CSV at `codex_history/selective_prefix_sweep_20260416_160050/summary.csv`.
+  - Baseline full prefix: mean minADE `1.0337m`, mean diffusion latency `215.90ms`.
+  - Best among the tested sparse groups was `early_0_5`: mean minADE `3.4687m`, mean diffusion latency `130.22ms`.
+  - `late_24_29` was close: mean minADE `3.7205m`, mean diffusion latency `130.69ms`.
+- Why it succeeded:
+  - The sweep script now uses the correct Python environment and parses summary lines with `grep`.
+- Files created or changed:
+  - `codex_history/selective_prefix_sweep_20260416_160050/summary.csv`
+  - raw logs under `codex_history/selective_prefix_sweep_20260416_160050/raw/`
+- Validation run:
+  - `./tools/run_selective_prefix_sweep.sh`
+- Next recommended step:
+  - Run a second-stage refinement around the least-bad groups (`0-5` and `24-29`) instead of broader sets, and compare contiguous vs interleaved choices nearby.
+
+## Selective prefix refinement sweep
+- What was tried:
+  - Added a second-stage refinement sweep script focused on the two least-bad groups from the first sweep (`0-5` and `24-29`).
+- Why it was tried:
+  - The first sweep showed that broad sparse choices were mostly poor, but `0-5` and `24-29` were relatively less damaging, so the next step is local refinement rather than random new groups.
+- What failed:
+  - N/A.
+- Why it failed:
+  - N/A.
+- What succeeded:
+  - Created `tools/run_selective_prefix_refine.sh` with contiguous, shifted, and interleaved variants around the early and late candidate regions.
+  - The script writes raw logs and a summary CSV just like the first sweep.
+- Why it succeeded:
+  - The first sweep already established a reusable automation pattern and identified concrete regions worth refining.
+- Files created or changed:
+  - `tools/run_selective_prefix_refine.sh`
+- Validation run:
+  - `bash -n tools/run_selective_prefix_refine.sh`
+- Next recommended step:
+  - Run the refinement sweep and compare not just the best mean minADE, but also whether any refined set improves over the `0-5` / `24-29` first-stage candidates without giving back too much latency.
+
+## Selective prefix refinement results
+- What was tried:
+  - Ran the second-stage refinement sweep around the two least-bad regions from the first sweep: `0-5` and `24-29`.
+- Why it was tried:
+  - To check whether a nearby contiguous or interleaved sparse layer set could preserve more accuracy without giving back too much latency.
+- What failed:
+  - No refined sparse set came close to the full-prefix baseline accuracy.
+- Why it failed:
+  - The pretrained model appears strongly aligned to full-prefix conditioning, so even the best sparse choices still lose substantial planning quality.
+- What succeeded:
+  - Produced a valid refinement summary at `codex_history/selective_prefix_refine_20260416_165807/summary.csv`.
+  - Full prefix baseline: mean minADE `1.0337m`, diffusion latency `217.43ms`.
+  - Best refined sets were early-layer biased:
+    - `0,1,4,5`: mean minADE `3.4109m`, diffusion latency `125.18ms`
+    - `0,2,4,6,8`: mean minADE `3.4138m`, diffusion latency `127.14ms`
+    - `0,1,2,3,4,5`: mean minADE `3.4687m`, diffusion latency `130.02ms`
+  - Best late-layer refined set was `24,25,26,27,28,29`: mean minADE `3.7205m`, diffusion latency `130.98ms`.
+- Why it succeeded:
+  - The refinement sweep focused on the only regions that were not obviously catastrophic in the first pass.
+- Files created or changed:
+  - `codex_history/selective_prefix_refine_20260416_165807/summary.csv`
+  - raw logs under `codex_history/selective_prefix_refine_20260416_165807/raw/`
+- Validation run:
+  - `./tools/run_selective_prefix_refine.sh`
+- Next recommended step:
+  - If continuing this direction, frame the current finding as `training-free sparse prefix dropping gives strong latency gains but still significant quality loss`; further work would need either learned sensitivity metrics or retraining/fine-tuning to recover accuracy.
+
+## Head and dim ablation hooks
+- What was tried:
+  - Added single-head and single-dimension ablation support to expert self-attention, plus sweep scripts for head-level and dim-level experiments.
+- Why it was tried:
+  - The user wants to measure sensitivity not just at the layer level, but at the head level and eventually the per-dimension level within each head.
+- What failed:
+  - N/A.
+- Why it failed:
+  - N/A.
+- What succeeded:
+  - Added config/CLI support for `--ablate-head <layer>:<head>` and `--ablate-dim <layer>:<head>:<dim>`.
+  - Implemented forward-time ablation by temporarily zeroing the corresponding input columns of `self_attn.o_proj`, which removes the contribution of the chosen head or sub-dimension for one layer.
+  - Added `tools/run_head_ablation_sweep.sh` and `tools/run_dim_ablation_sweep.sh` with CSV logging and raw log capture.
+- Why it succeeded:
+  - Ablating `o_proj` input columns is a clean way to suppress one head/sub-dimension contribution without rewriting the Hugging Face attention kernel.
+- Files created or changed:
+  - `src/alpamayo1_5/config.py`
+  - `src/alpamayo1_5/models/expert_selective_layer.py`
+  - `src/alpamayo1_5/models/alpamayo1_5.py`
+  - `src/alpamayo1_5/test_inference.py`
+  - `tools/run_head_ablation_sweep.sh`
+  - `tools/run_dim_ablation_sweep.sh`
+- Validation run:
+  - `bash -n tools/run_head_ablation_sweep.sh`
+  - `bash -n tools/run_dim_ablation_sweep.sh`
+  - `python3 -m py_compile src/alpamayo1_5/config.py src/alpamayo1_5/models/expert_selective_layer.py src/alpamayo1_5/models/alpamayo1_5.py src/alpamayo1_5/test_inference.py`
+- Next recommended step:
+  - Start with a small head sweep on the best current sparse prefix set (for example `SELECT_PREFIX=0,1,4,5`) before attempting any full 36x16x128 dim sweep, which will be extremely expensive.

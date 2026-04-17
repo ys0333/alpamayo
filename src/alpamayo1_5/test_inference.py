@@ -102,9 +102,21 @@ def parse_args() -> argparse.Namespace:
         help="Run only the VLM generate stage and skip diffusion/planning.",
     )
     parser.add_argument(
-        "--print-block-attn-stats",
+        "--print-block",
         action="store_true",
         help="Print per-block attention workload stats for the first expert forward in each inference.",
+    )
+    parser.add_argument(
+        "--ablate-head",
+        type=str,
+        default=None,
+        help="Ablate one attention head using format '<layer>:<head>' (0-based).",
+    )
+    parser.add_argument(
+        "--ablate-dim",
+        type=str,
+        default=None,
+        help="Ablate one attention sub-dimension using format '<layer>:<head>:<dim>' (all 0-based).",
     )
     return parser.parse_args()
 
@@ -124,6 +136,8 @@ def main() -> None:
             expert_cross_attention_layers=expert_cross_attention_layers,
             expert_cross_attention_replace_prefix=not args.keep_prefix_self_attention,
             expert_prefix_layers=expert_prefix_layers,
+            expert_ablate_head=args.ablate_head,
+            expert_ablate_dim=args.ablate_dim,
         ).to("cuda")
     with nvtx_range("build_processor"):
         processor = helper.get_processor(model.tokenizer)
@@ -185,7 +199,7 @@ def main() -> None:
                     max_generation_length=256,
                     return_extra=True,
                     return_timings=True,
-                    return_attention_debug=args.print_block_attn_stats,
+                    return_attention_debug=args.print_block,
                 )
         inference_latency_ms = (time.perf_counter() - inference_start) * 1000.0
         timings_ms = extra.get("timings_ms", {})
@@ -209,7 +223,7 @@ def main() -> None:
             print(
                 f"diffusion / e2e ratio: {100.0 * diffusion_latency_ms / inference_latency_ms:.2f}%"
             )
-        if args.print_block_attn_stats and "attention_debug" in extra:
+        if args.print_block and "attention_debug" in extra:
             _print_attention_debug(extra["attention_debug"])
         if min_ade >= 1.0:
             print(
