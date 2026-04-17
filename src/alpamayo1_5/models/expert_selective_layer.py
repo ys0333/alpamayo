@@ -483,6 +483,7 @@ def attach_expert_cross_attention(
     layer_spec: str | int | Iterable[int] | None,
     replace_prefix_self_attention: bool = True,
     prefix_self_attention_layers: str | int | Iterable[int] | None = None,
+    drop_prefix_self_attention_layers: str | int | Iterable[int] | None = None,
     ablate_head_spec: str | None = None,
     ablate_dim_spec: str | None = None,
 ) -> tuple[list[int], list[int]]:
@@ -492,6 +493,9 @@ def attach_expert_cross_attention(
 
     indices = resolve_cross_attention_layer_indices(len(layers), layer_spec)
     prefix_indices = resolve_cross_attention_layer_indices(len(layers), prefix_self_attention_layers)
+    drop_prefix_indices = resolve_cross_attention_layer_indices(
+        len(layers), drop_prefix_self_attention_layers
+    )
     ablate_head = _parse_ablate_head_spec(ablate_head_spec)
     ablate_dim = _parse_ablate_dim_spec(ablate_dim_spec)
     sample_attn = layers[0].self_attn
@@ -519,7 +523,9 @@ def attach_expert_cross_attention(
             layers[idx] = Qwen3CrossAttentionDecoderLayer(
                 layers[idx],
                 replace_prefix_self_attention=(
-                    replace_prefix_self_attention and idx not in prefix_indices
+                    replace_prefix_self_attention
+                    and idx not in prefix_indices
+                    and idx in drop_prefix_indices
                 ),
                 enable_cross_attention=idx in indices,
                 ablate_head_idx=layer_ablate_head_idx,
@@ -528,7 +534,9 @@ def attach_expert_cross_attention(
         else:
             layers[idx] = Qwen3SelectivePrefixDecoderLayer(
                 layers[idx],
-                keep_prefix_self_attention=idx in prefix_indices,
+                keep_prefix_self_attention=(
+                    (not prefix_indices or idx in prefix_indices) and idx not in drop_prefix_indices
+                ),
                 ablate_head_idx=layer_ablate_head_idx,
                 ablate_dim_idx=layer_ablate_dim_idx,
             )

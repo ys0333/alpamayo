@@ -35,6 +35,7 @@ class Alpamayo1_5Config(ReasoningVLAConfig):
         expert_cross_attention_layers: str | int | list[int] | None = None,
         expert_cross_attention_replace_prefix: bool = True,
         expert_prefix_layers: str | int | list[int] | None = None,
+        expert_drop_prefix_layers: str | int | list[int] | None = None,
         expert_ablate_head: str | None = None,
         expert_ablate_dim: str | None = None,
         keep_same_dtype: bool = True,
@@ -52,6 +53,7 @@ class Alpamayo1_5Config(ReasoningVLAConfig):
         self.expert_cross_attention_layers = expert_cross_attention_layers
         self.expert_cross_attention_replace_prefix = expert_cross_attention_replace_prefix
         self.expert_prefix_layers = expert_prefix_layers
+        self.expert_drop_prefix_layers = expert_drop_prefix_layers
         self.expert_ablate_head = expert_ablate_head
         self.expert_ablate_dim = expert_ablate_dim
         self.keep_same_dtype = keep_same_dtype

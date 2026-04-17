@@ -92,6 +92,12 @@ def parse_args() -> argparse.Namespace:
         help='Keep prefix self-attention only on selected expert blocks. Use "all" or comma-separated layer indices such as "24,28,32,35". When set, unselected layers ignore prefix KV cache.',
     )
     parser.add_argument(
+        "--drop-prefix",
+        type=str,
+        default=None,
+        help='Drop prefix self-attention only on selected expert blocks. Use "all" or comma-separated layer indices such as "24,28,32,35". When set alone, all other blocks keep prefix.',
+    )
+    parser.add_argument(
         "--keep-prefix-self-attention",
         action="store_true",
         help="Keep the original prefix-based self-attention in cross-attention-enabled expert blocks. By default, selected blocks use cross-attention as the only conditioning path.",
@@ -128,6 +134,7 @@ def main() -> None:
         args.expert_cross_attention_layers
     )
     expert_prefix_layers = _parse_cross_attention_layers(args.select_prefix)
+    expert_drop_prefix_layers = _parse_cross_attention_layers(args.drop_prefix)
 
     with nvtx_range("load_model"):
         model = Alpamayo1_5.from_pretrained(
@@ -136,6 +143,7 @@ def main() -> None:
             expert_cross_attention_layers=expert_cross_attention_layers,
             expert_cross_attention_replace_prefix=not args.keep_prefix_self_attention,
             expert_prefix_layers=expert_prefix_layers,
+            expert_drop_prefix_layers=expert_drop_prefix_layers,
             expert_ablate_head=args.ablate_head,
             expert_ablate_dim=args.ablate_dim,
         ).to("cuda")

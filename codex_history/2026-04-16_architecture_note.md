@@ -697,3 +697,33 @@
   - `python3 -m py_compile src/alpamayo1_5/config.py src/alpamayo1_5/models/expert_selective_layer.py src/alpamayo1_5/models/alpamayo1_5.py src/alpamayo1_5/test_inference.py`
 - Next recommended step:
   - Run `tools/run_head_ablation_sweep.sh` first, inspect the top heads by `delta_vs_baseline_m`, then let `tools/run_dim_ablation_sweep.sh` automatically refine only those heads.
+
+## Drop-prefix experiment shift
+- What was tried:
+  - Reframed the sparse-prefix sensitivity experiments from `keep-only` to `drop-from-full-prefix` and added corresponding CLI/config plus two new sweep scripts.
+- Why it was tried:
+  - The user pointed out that true sensitivity should be measured by comparing each block with vs. without prefix while keeping all other blocks unchanged.
+- What failed:
+  - The earlier `keep-only` design mixed block importance with catastrophic context removal, making sensitivity interpretation less direct.
+- Why it failed:
+  - Keeping only a small set of blocks is a much harsher intervention than ablating one block/group from the full-prefix baseline.
+- What succeeded:
+  - Added `expert_drop_prefix_layers` and `--drop-prefix`.
+  - Updated selective-layer wiring so drop-prefix removes prefix only on chosen layers while all other layers remain full-prefix.
+  - Added `tools/run_drop_prefix_sweep.sh` for group ablations from the full baseline.
+  - Added `tools/run_drop_prefix_refine.sh` for second-stage local refinement around the least-sensitive groups.
+- Why it succeeded:
+  - Drop-prefix is the correct direct measure of which blocks are insensitive to removing prefix conditioning.
+- Files created or changed:
+  - `src/alpamayo1_5/config.py`
+  - `src/alpamayo1_5/models/expert_selective_layer.py`
+  - `src/alpamayo1_5/models/alpamayo1_5.py`
+  - `src/alpamayo1_5/test_inference.py`
+  - `tools/run_drop_prefix_sweep.sh`
+  - `tools/run_drop_prefix_refine.sh`
+- Validation run:
+  - `bash -n tools/run_drop_prefix_sweep.sh`
+  - `bash -n tools/run_drop_prefix_refine.sh`
+  - `python3 -m py_compile src/alpamayo1_5/config.py src/alpamayo1_5/models/expert_selective_layer.py src/alpamayo1_5/models/alpamayo1_5.py src/alpamayo1_5/test_inference.py`
+- Next recommended step:
+  - Run `tools/run_drop_prefix_sweep.sh` first; only after identifying the least-sensitive dropped group should the refinement sweep or head/dim ablations be interpreted seriously.
