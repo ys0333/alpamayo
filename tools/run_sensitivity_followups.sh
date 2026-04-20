@@ -48,14 +48,12 @@ run_case() {
     cmd+=("--ablate-head" "$spec")
   fi
 
-  {
-    printf 'COMMAND:'
-    printf ' %q' "${cmd[@]}"
-    printf '\n'
-  } | tee "$raw_log"
+  printf 'COMMAND:' | tee "$raw_log" >&2
+  printf ' %q' "${cmd[@]}" | tee -a "$raw_log" >&2
+  printf '\n' | tee -a "$raw_log" >&2
 
-  if "${cmd[@]}" | tee -a "$raw_log"; then
-    grep 'Summary over ' "$raw_log" | tail -n 1 || true
+  if "${cmd[@]}" | tee -a "$raw_log" >&2; then
+    grep 'Summary over ' "$raw_log" | tail -n 1
   else
     return 1
   fi
@@ -100,20 +98,21 @@ baseline_minade="$(parse_metric "$baseline_summary" 's/.*mean minADE=\([0-9.]*\)
 append_summary "baseline" "baseline_full_prefix" "baseline" "" "$baseline_summary" "$baseline_minade"
 
 # 1) Re-check top insensitive/sensitive single-block drops from prior sweep.
-declare -A DROP_RECHECKS=(
-  [insensitive_34]="34"
-  [insensitive_27]="27"
-  [insensitive_23]="23"
-  [insensitive_26]="26"
-  [insensitive_18]="18"
-  [sensitive_15]="15"
-  [sensitive_13]="13"
-  [sensitive_12]="12"
-  [sensitive_24]="24"
+DROP_RECHECKS=(
+  "insensitive_34:34"
+  "insensitive_27:27"
+  "insensitive_23:23"
+  "insensitive_26:26"
+  "insensitive_18:18"
+  "sensitive_15:15"
+  "sensitive_13:13"
+  "sensitive_12:12"
+  "sensitive_24:24"
 )
 
-for case_name in "${!DROP_RECHECKS[@]}"; do
-  spec="${DROP_RECHECKS[$case_name]}"
+for entry in "${DROP_RECHECKS[@]}"; do
+  case_name="${entry%%:*}"
+  spec="${entry#*:}"
   raw_log="$RAW_DIR/recheck_${case_name}.log"
   summary_line="$(run_case "recheck" "$case_name" "drop-prefix" "$spec" "$raw_log" || true)"
   if [[ -n "$summary_line" ]]; then
@@ -124,17 +123,18 @@ for case_name in "${!DROP_RECHECKS[@]}"; do
 done
 
 # 2) Refine around least-sensitive group 18-23.
-declare -A GROUP_REFINES=(
-  [group_18_20]="18,19,20"
-  [group_21_23]="21,22,23"
-  [group_18_19_22_23]="18,19,22,23"
-  [group_18_21_23]="18,21,23"
-  [group_17_22]="17,18,19,20,21,22"
-  [group_19_24]="19,20,21,22,23,24"
+GROUP_REFINES=(
+  "group_18_20:18,19,20"
+  "group_21_23:21,22,23"
+  "group_18_19_22_23:18,19,22,23"
+  "group_18_21_23:18,21,23"
+  "group_17_22:17,18,19,20,21,22"
+  "group_19_24:19,20,21,22,23,24"
 )
 
-for case_name in "${!GROUP_REFINES[@]}"; do
-  spec="${GROUP_REFINES[$case_name]}"
+for entry in "${GROUP_REFINES[@]}"; do
+  case_name="${entry%%:*}"
+  spec="${entry#*:}"
   raw_log="$RAW_DIR/refine_${case_name}.log"
   summary_line="$(run_case "group_refine" "$case_name" "drop-prefix" "$spec" "$raw_log" || true)"
   if [[ -n "$summary_line" ]]; then

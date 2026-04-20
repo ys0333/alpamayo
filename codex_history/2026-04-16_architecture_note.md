@@ -826,3 +826,29 @@
   - `bash -n tools/run_sensitivity_followups.sh`
 - Next recommended step:
   - Run `PYTHON_BIN=/home/jys/a1_5_venv/bin/python3 ./tools/run_sensitivity_followups.sh`, then rank all 576 heads by `delta_vs_baseline_m` to identify globally low-impact heads worth pruning first.
+
+## Follow-up monitoring and CSV fix
+- What was tried:
+  - Monitored `codex_history/sensitivity_followups_20260420_091955` while the follow-up sweep was expected to be running.
+- Why it was tried:
+  - The user asked to check experiment progress from the live logs.
+- What failed:
+  - No `test_inference.py` or `run_sensitivity_followups.sh` process was still running when checked.
+  - The active run had stopped after creating `raw/head_l0_h4.log` with only the command line written.
+  - The summary CSV was malformed, with each metric duplicated onto separate lines.
+- Why it failed:
+  - The script used command substitution around `run_case`, while `tee` also wrote the full inference output to stdout; that caused all tee output to be captured as the "summary line" and then written into CSV rows.
+  - The exact stop reason for `head_l0_h4` was not visible in the log because that raw file ended before model execution output.
+- What succeeded:
+  - Confirmed that the completed part includes baseline, block rechecks, group refinements, and head ablations through `head_l0_h3`.
+  - Updated `run_sensitivity_followups.sh` so `tee` progress output goes to stderr and only the final `Summary over ...` line is returned for CSV parsing.
+  - Replaced associative arrays with ordered lists so recheck/refine cases run in a deterministic order.
+- Why it succeeded:
+  - Separating progress output from command-substitution stdout prevents multiline logs from contaminating `summary.csv`.
+- Files created or changed:
+  - `tools/run_sensitivity_followups.sh`
+  - `codex_history/2026-04-16_architecture_note.md`
+- Validation run:
+  - `bash -n tools/run_sensitivity_followups.sh`
+- Next recommended step:
+  - Restart `PYTHON_BIN=/home/jys/a1_5_venv/bin/python3 ./tools/run_sensitivity_followups.sh` to produce a clean summary CSV; the previous `sensitivity_followups_20260420_091955` directory should be treated as partial.
