@@ -814,9 +814,9 @@
   - Added `tools/run_sensitivity_followups.sh` to automate:
     - rechecks of least-/most-sensitive single-block drops
     - refinements around the relatively insensitive `18~23` region
-    - focused head ablations for relatively insensitive layers `18`, `23`, `26`, `27`, and `34`
+    - exhaustive head ablations for all `36 x 16 = 576` heads across the full expert stack
 - Why it succeeded:
-  - The repaired drop-prefix path now measures block sensitivity against the full-prefix baseline correctly, and the follow-up script now aligns with the actual research goal: find low-impact regions where computation can be removed with limited accuracy loss.
+  - The repaired drop-prefix path now measures block sensitivity against the full-prefix baseline correctly, and the follow-up script now covers both the low-impact block search and a full head-level sensitivity map across the entire model.
 - Files created or changed:
   - `src/alpamayo1_5/models/expert_selective_layer.py`
   - `tools/run_sensitivity_followups.sh`
@@ -825,4 +825,4 @@
   - `python3 src/alpamayo1_5/test_inference.py --drop-prefix 0 --nums 1 --print-block`
   - `bash -n tools/run_sensitivity_followups.sh`
 - Next recommended step:
-  - Run `PYTHON_BIN=/home/jys/a1_5_venv/bin/python3 ./tools/run_sensitivity_followups.sh`, then inspect whether specific heads inside the relatively insensitive blocks can be removed with even smaller additional minADE degradation.
+  - Run `PYTHON_BIN=/home/jys/a1_5_venv/bin/python3 ./tools/run_sensitivity_followups.sh`, then rank all 576 heads by `delta_vs_baseline_m` to identify globally low-impact heads worth pruning first.
