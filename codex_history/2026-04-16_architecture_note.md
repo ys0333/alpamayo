@@ -852,3 +852,27 @@
   - `bash -n tools/run_sensitivity_followups.sh`
 - Next recommended step:
   - Restart `PYTHON_BIN=/home/jys/a1_5_venv/bin/python3 ./tools/run_sensitivity_followups.sh` to produce a clean summary CSV; the previous `sensitivity_followups_20260420_091955` directory should be treated as partial.
+
+## Follow-up run live status
+- What was tried:
+  - Monitored the active/partial follow-up run in `codex_history/sensitivity_followups_20260420_091955`.
+- Why it was tried:
+  - The user asked whether sensitivity values were being collected correctly while logs were accumulating.
+- What failed:
+  - The run is still using the pre-fix summary writer, so `summary.csv` remains malformed and should not be used directly.
+- Why it failed:
+  - The running bash process was started before the script fix that redirected `tee` progress output away from command-substitution stdout.
+- What succeeded:
+  - The run is still active under PID `193126` with child Python PID `193129`, currently running `--ablate-head 2:11`.
+  - Raw logs contain completed summaries for 59 cases so far.
+  - Completed head ablations up to `head_l2_h10` show almost no mean-minADE delta versus baseline, with observed deltas around `-0.0002m` to `+0.0009m`.
+- Why it succeeded:
+  - Raw logs include clean `Summary over ...` lines even though the aggregate CSV is malformed.
+- Files created or changed:
+  - `codex_history/2026-04-16_architecture_note.md`
+- Validation run:
+  - `ps -p 193129 -o pid,stat,etime,pcpu,pmem,cmd`
+  - `grep -l 'Summary over ' codex_history/sensitivity_followups_20260420_091955/raw/*.log | wc -l`
+  - raw-log delta ranking against `raw/baseline.log`
+- Next recommended step:
+  - Let the current run continue if raw logs are sufficient, but restart with the fixed script if a clean CSV is required.
