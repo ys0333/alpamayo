@@ -13,6 +13,7 @@ _ATTENTION_DEBUG_STATE: dict[str, Any] = {
     "enabled": False,
     "capture_once": True,
     "captured": False,
+    "record_current_call": False,
     "self_attn_layers": [],
     "cross_attn_layers": [],
     "expert_forward_calls": 0,
@@ -24,6 +25,7 @@ def reset_attention_debug_state(enabled: bool = False, capture_once: bool = True
     _ATTENTION_DEBUG_STATE["enabled"] = enabled
     _ATTENTION_DEBUG_STATE["capture_once"] = capture_once
     _ATTENTION_DEBUG_STATE["captured"] = False
+    _ATTENTION_DEBUG_STATE["record_current_call"] = False
     _ATTENTION_DEBUG_STATE["self_attn_layers"] = []
     _ATTENTION_DEBUG_STATE["cross_attn_layers"] = []
     _ATTENTION_DEBUG_STATE["expert_forward_calls"] = 0
@@ -35,6 +37,7 @@ def get_attention_debug_state() -> dict[str, Any]:
         "enabled": _ATTENTION_DEBUG_STATE["enabled"],
         "capture_once": _ATTENTION_DEBUG_STATE["capture_once"],
         "captured": _ATTENTION_DEBUG_STATE["captured"],
+        "record_current_call": _ATTENTION_DEBUG_STATE["record_current_call"],
         "expert_forward_calls": _ATTENTION_DEBUG_STATE["expert_forward_calls"],
         "self_attn_layers": list(_ATTENTION_DEBUG_STATE["self_attn_layers"]),
         "cross_attn_layers": list(_ATTENTION_DEBUG_STATE["cross_attn_layers"]),
@@ -46,14 +49,20 @@ def begin_attention_debug_capture() -> None:
     if not _ATTENTION_DEBUG_STATE["enabled"]:
         return
     _ATTENTION_DEBUG_STATE["expert_forward_calls"] += 1
+    if _ATTENTION_DEBUG_STATE["capture_once"]:
+        if _ATTENTION_DEBUG_STATE["captured"]:
+            _ATTENTION_DEBUG_STATE["record_current_call"] = False
+        else:
+            _ATTENTION_DEBUG_STATE["record_current_call"] = True
+            _ATTENTION_DEBUG_STATE["captured"] = True
+    else:
+        _ATTENTION_DEBUG_STATE["record_current_call"] = True
 
 
 def _should_capture_attention_debug() -> bool:
     if not _ATTENTION_DEBUG_STATE["enabled"]:
         return False
-    if _ATTENTION_DEBUG_STATE["capture_once"] and _ATTENTION_DEBUG_STATE["captured"]:
-        return False
-    return True
+    return bool(_ATTENTION_DEBUG_STATE["record_current_call"])
 
 
 def _record_self_attention_debug(
@@ -96,7 +105,6 @@ def _record_cross_attention_debug(
             "attention_scores": int(query_length * kv_length * num_heads),
         }
     )
-    _ATTENTION_DEBUG_STATE["captured"] = True
 
 
 def _repeat_kv_heads(x: torch.Tensor, num_attention_heads: int) -> torch.Tensor:

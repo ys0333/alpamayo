@@ -775,3 +775,54 @@
   - `python3 -m py_compile src/alpamayo1_5/models/expert_selective_layer.py src/alpamayo1_5/models/alpamayo1_5.py src/alpamayo1_5/test_inference.py src/alpamayo1_5/config.py`
 - Next recommended step:
   - Re-run `python3 src/alpamayo1_5/test_inference.py --drop-prefix 0 --nums 1 --print-block` and confirm only layer 0 switches to `mode=local`; then rerun the drop-prefix sweep.
+
+## Attention debug capture fix
+- What was tried:
+  - Fixed repeated block-attention debug output after confirming `--drop-prefix 0` correctly switched only layer 0 to local attention.
+- Why it was tried:
+  - The debug print was repeating the same 36-layer report for every diffusion step, making inspection noisy.
+- What failed:
+  - `capture_once=True` did not actually stop later expert forward captures for self-attention debug.
+- Why it failed:
+  - The `captured` flag was only being set on the cross-attention debug path, not the self-attention-only path.
+- What succeeded:
+  - Added an explicit `record_current_call` gate so only the first expert forward is recorded when `capture_once=True`.
+- Why it succeeded:
+  - The capture state now flips to recorded at the start of the first expert forward instead of depending on cross-attention instrumentation.
+- Files created or changed:
+  - `src/alpamayo1_5/models/expert_selective_layer.py`
+- Validation run:
+  - `python3 -m py_compile src/alpamayo1_5/models/expert_selective_layer.py src/alpamayo1_5/models/alpamayo1_5.py src/alpamayo1_5/test_inference.py`
+- Next recommended step:
+  - Re-run a one-sample `--drop-prefix ... --print-block` command to confirm a single 36-layer report is printed, then rerun the full drop-prefix sweep.
+
+## Block sensitivity status and follow-up automation
+- What was tried:
+  - Re-ran block sensitivity analysis after fixing drop-prefix activation and attention-debug capture, then added a follow-up sweep script for the next recommended experiments.
+- Why it was tried:
+  - The previous drop-prefix sweep had been invalid before the wrapper activation fix, and the next step needed to be automated instead of manually running each follow-up case.
+- What failed:
+  - The first `drop_prefix_sweep_20260417_111601` summary was effectively invalid, and the CSV formatting in later summaries remained messy.
+- Why it failed:
+  - The early sweep ran before `drop_prefix_indices` actually triggered wrapper installation; later the raw metrics were correct but summary rows still contained duplicated newline-separated values.
+- What succeeded:
+  - A valid drop-prefix sweep at `codex_history/drop_prefix_sweep_20260417_154623/summary.csv` showed meaningful block-level sensitivity:
+    - least-sensitive single-block drops included `34` and `27`
+    - highly sensitive blocks clustered around `12~15`
+    - least-sensitive coarse group was around `18~23`
+  - `python3 src/alpamayo1_5/test_inference.py --drop-prefix 0 --nums 1 --print-block` now cleanly shows only layer `0` switching to `mode=local`, with the other 35 layers remaining `mode=prefix`.
+  - Added `tools/run_sensitivity_followups.sh` to automate:
+    - rechecks of least-/most-sensitive single-block drops
+    - refinements around the relatively insensitive `18~23` region
+    - focused head ablations for sensitive layers `12`, `13`, and `15`
+- Why it succeeded:
+  - The repaired drop-prefix path now measures block sensitivity against the full-prefix baseline correctly, and the follow-up script packages the next recommended cases into one reproducible run.
+- Files created or changed:
+  - `src/alpamayo1_5/models/expert_selective_layer.py`
+  - `tools/run_sensitivity_followups.sh`
+  - `codex_history/2026-04-16_architecture_note.md`
+- Validation run:
+  - `python3 src/alpamayo1_5/test_inference.py --drop-prefix 0 --nums 1 --print-block`
+  - `bash -n tools/run_sensitivity_followups.sh`
+- Next recommended step:
+  - Run `PYTHON_BIN=/home/jys/a1_5_venv/bin/python3 ./tools/run_sensitivity_followups.sh`, then inspect the resulting summary before deciding whether a full head-level sweep is still necessary.
