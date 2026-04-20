@@ -144,8 +144,8 @@ for case_name in "${!GROUP_REFINES[@]}"; do
   fi
 done
 
-# 3) Focused head ablation inside sensitive blocks (full-prefix context).
-for layer in 12 13 15; do
+# 3) Focused head ablation inside relatively insensitive blocks (full-prefix context).
+for layer in 18 23 26 27 34; do
   for head in $(seq 0 15); do
     case_name="head_l${layer}_h${head}"
     spec="${layer}:${head}"
